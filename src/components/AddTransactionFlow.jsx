@@ -80,19 +80,58 @@ const getBillLabel = (operation, isGramsBalance) => {
 const fmt  = (v) => parseFloat(v || 0).toFixed(2);
 const fmtG = (v) => parseFloat(v || 0).toFixed(3);
 
-const genWhatsApp = (customer) => {
+const genWhatsApp = (customer, newTx, prevTxs = []) => {
+    // ── New transaction line ─────────────────────────────────────────────────
+    const isGot      = newTx.operation === 'YOU_GOT';
+    const isGramsTx  = newTx.gramsIsBal;
+    const newAmt     = isGramsTx
+        ? `${fmtG(newTx.primaryAmount)}g`
+        : `₹${fmt(newTx.primaryAmount)}`;
+    const txLabel    = isGot ? `We received ${newAmt}` : `We gave ${newAmt}`;
+    const catLine    = newTx.category + (newTx.subType ? ` (${newTx.subType})` : '');
+    const descLine   = newTx.description ? `\nNote: ${newTx.description}` : '';
+
+    // ── Updated balance ──────────────────────────────────────────────────────
     const cash   = parseFloat(customer.cashBalance   || 0);
     const gold   = parseFloat(customer.goldBalance   || 0);
     const silver = parseFloat(customer.silverBalance || 0);
-    const parts  = [];
-    if (cash   !== 0) parts.push(`₹${fmt(Math.abs(cash))}`);
-    if (gold   !== 0) parts.push(`${fmtG(Math.abs(gold))}g gold`);
-    if (silver !== 0) parts.push(`${fmtG(Math.abs(silver))}g silver`);
-    const bal = parts.join(' / ') || '₹0';
+    const balParts = [];
+    if (cash   !== 0) balParts.push(`₹${fmt(Math.abs(cash))} ${cash >= 0 ? '(you owe us)' : '(we owe you)'}`);
+    if (gold   !== 0) balParts.push(`${fmtG(Math.abs(gold))}g gold ${gold >= 0 ? '(you owe us)' : '(we owe you)'}`);
+    if (silver !== 0) balParts.push(`${fmtG(Math.abs(silver))}g silver ${silver >= 0 ? '(you owe us)' : '(we owe you)'}`);
+    const balStr = balParts.length ? balParts.join(', ') : 'Nil';
+
     const due = customer.due_date
         ? new Date(customer.due_date).toLocaleDateString('en-IN')
-        : 'N/A';
-    const text = `Dear ${customer.name},\nYour outstanding balance at JJ Jewellers: ${bal}.\nDue Date: ${due}\n— JJ Jewellers`;
+        : null;
+
+    // ── Last 5 transactions history ──────────────────────────────────────────
+    let historyBlock = '';
+    if (prevTxs.length > 0) {
+        const lines = prevTxs.map(t => {
+            const tGot   = t.jama > 0;
+            const tAmt   = tGot ? t.jama : t.nave;
+            const tGrams = t.type === 'GOLD' || t.type === 'SILVER';
+            const tAmtStr = tGrams ? `${fmtG(tAmt)}g` : `₹${fmt(tAmt)}`;
+            const tCat   = [t.category, t.sub_type].filter(Boolean).join('·');
+            return `  ${t.date}  ${tGot ? '+' : '−'}${tAmtStr}  ${tCat}${t.description ? ' ' + t.description : ''}`;
+        });
+        historyBlock = `\n\n*Recent transactions:*\n${lines.join('\n')}`;
+    }
+
+    const text = [
+        `Dear ${customer.name},`,
+        ``,
+        `*New transaction — JJ Jewellers*`,
+        `${txLabel}  |  ${catLine}  |  ${newTx.date}${descLine}`,
+        ``,
+        `*Current balance:* ${balStr}`,
+        due ? `*Due date:* ${due}` : null,
+        historyBlock || null,
+        ``,
+        `— JJ Jewellers`,
+    ].filter(l => l !== null).join('\n');
+
     let mob = customer.mobile;
     if (!mob.startsWith('91')) mob = '91' + mob;
     return `https://wa.me/${mob}?text=${encodeURIComponent(text)}`;
@@ -252,7 +291,18 @@ const AddTransactionFlow = ({ onClose, presetCustomerId = null }) => {
                 images,
             });
 
-            if (form.whatsapp) window.open(genWhatsApp(selectedCustomer), '_blank');
+            if (form.whatsapp) {
+                const newTxCtx = {
+                    operation:    form.operation,
+                    primaryAmount,
+                    gramsIsBal,
+                    category:     form.category,
+                    subType:      form.subType,
+                    description:  form.description,
+                    date:         form.date,
+                };
+                window.open(genWhatsApp(selectedCustomer, newTxCtx, lastFiveTxs), '_blank');
+            }
             setReceiptData({ transaction: entry, customer: selectedCustomer });
         } catch (err) {
             alert('Save failed: ' + err.message);
