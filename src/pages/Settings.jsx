@@ -4,7 +4,7 @@ import { Card, Button } from '../components/ui/Primitives';
 import { useAppContext } from '../context/AppContext';
 import { useToast } from '../components/ui/Toast';
 import { supabase, isSupabaseReady } from '../lib/supabase';
-import { Database, Trash2, ArrowLeft, KeyRound, Eye, EyeOff } from 'lucide-react';
+import { Database, Trash2, ArrowLeft, KeyRound, Eye, EyeOff, ShieldCheck } from 'lucide-react';
 
 const hashPassword = async (text) => {
     const msgUint8 = new TextEncoder().encode(text);
@@ -30,6 +30,53 @@ const Settings = () => {
     const [newPasscode, setNewPasscode] = useState('');
     const [showNewPass, setShowNewPass] = useState(false);
     const [savingPasscode, setSavingPasscode] = useState(false);
+
+    // 2FA / OTP state
+    const [otpEnabled, setOtpEnabled]   = useState(false);
+    const [otpEmail, setOtpEmail]       = useState('');
+    const [otpLoaded, setOtpLoaded]     = useState(false);
+    const [savingOtp, setSavingOtp]     = useState(false);
+
+    // Load current OTP settings
+    React.useEffect(() => {
+        if (!isOwner || !isSupabaseReady() || !orgId) return;
+        supabase
+            .from('organizations')
+            .select('otp_enabled, otp_email')
+            .eq('id', orgId)
+            .single()
+            .then(({ data }) => {
+                if (data) {
+                    setOtpEnabled(!!data.otp_enabled);
+                    setOtpEmail(data.otp_email || '');
+                }
+                setOtpLoaded(true);
+            });
+    }, [isOwner, orgId]);
+
+    const handleOtpSave = async () => {
+        if (otpEnabled && !otpEmail.includes('@')) {
+            toast.error('Enter a valid email address to receive OTP codes.');
+            return;
+        }
+        if (!isSupabaseReady() || !orgId) {
+            toast.error('Supabase not connected.');
+            return;
+        }
+        setSavingOtp(true);
+        try {
+            const { error } = await supabase
+                .from('organizations')
+                .update({ otp_enabled: otpEnabled, otp_email: otpEmail })
+                .eq('id', orgId);
+            if (error) throw error;
+            toast.success(otpEnabled ? '2FA enabled. OTP will be required at owner login.' : '2FA disabled.');
+        } catch (err) {
+            toast.error('Failed to save: ' + err.message);
+        } finally {
+            setSavingOtp(false);
+        }
+    };
 
     const handleSeed = () => {
         const msg = seedDummyData();
@@ -206,6 +253,94 @@ const Settings = () => {
                                     </div>
                                 ))}
                             </div>
+                        </div>
+                    )}
+
+                    {/* Two-Factor Authentication — owner only */}
+                    {isOwner && (
+                        <div style={{ borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '2rem' }}>
+                            <h3 style={{ marginBottom: '0.5rem', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                                <ShieldCheck size={16} /> Two-Factor Authentication (OTP)
+                            </h3>
+                            <p style={{ marginBottom: '1.25rem', fontSize: '0.875rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
+                                When enabled, the owner login requires a 6-digit code sent to your email after the passcode is accepted. Requires email setup via Resend (coming soon — test mode shows the code on screen for now).
+                            </p>
+
+                            {/* Enable toggle */}
+                            <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0.65rem 0.875rem', background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)', borderRadius: '10px', cursor: 'pointer', marginBottom: '0.75rem' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                                    <ShieldCheck size={16} style={{ color: otpEnabled ? '#10b981' : 'var(--text-muted)' }} />
+                                    <div>
+                                        <div style={{ fontSize: '0.9rem', fontWeight: 600 }}>
+                                            {otpEnabled ? 'Enabled' : 'Disabled'}
+                                        </div>
+                                        <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                                            {otpEnabled ? 'OTP required at owner login' : 'OTP step skipped at login'}
+                                        </div>
+                                    </div>
+                                </div>
+                                {/* Toggle switch */}
+                                <div
+                                    onClick={() => setOtpEnabled(v => !v)}
+                                    style={{
+                                        width: '44px', height: '24px', borderRadius: '12px',
+                                        background: otpEnabled ? '#10b981' : 'rgba(255,255,255,0.12)',
+                                        position: 'relative', cursor: 'pointer',
+                                        transition: 'background 0.2s', flexShrink: 0,
+                                        border: 'none',
+                                    }}
+                                >
+                                    <div style={{
+                                        position: 'absolute', top: '3px',
+                                        left: otpEnabled ? '22px' : '3px',
+                                        width: '18px', height: '18px', borderRadius: '50%',
+                                        background: '#fff',
+                                        transition: 'left 0.2s',
+                                        boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
+                                    }} />
+                                </div>
+                            </label>
+
+                            {/* Email field — shown when enabled */}
+                            {otpEnabled && (
+                                <div style={{ marginBottom: '0.75rem' }}>
+                                    <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)', display: 'block', marginBottom: '0.35rem' }}>
+                                        OTP delivery email
+                                    </label>
+                                    <input
+                                        type="email"
+                                        placeholder="e.g. jjledgerpro@gmail.com"
+                                        value={otpEmail}
+                                        onChange={e => setOtpEmail(e.target.value)}
+                                        style={{
+                                            width: '100%', padding: '0.55rem 0.75rem',
+                                            background: 'rgba(0,0,0,0.2)',
+                                            border: '1px solid rgba(255,255,255,0.1)',
+                                            borderRadius: '8px', color: 'var(--text-primary)',
+                                            fontSize: '0.875rem', outline: 'none', boxSizing: 'border-box',
+                                        }}
+                                    />
+                                    <p style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '0.3rem' }}>
+                                        ⚠ Email sending requires Resend setup (not yet configured). In test mode, the code is shown on the login screen.
+                                    </p>
+                                </div>
+                            )}
+
+                            <button
+                                onClick={handleOtpSave}
+                                disabled={savingOtp || !otpLoaded}
+                                style={{
+                                    padding: '0.55rem 1.25rem',
+                                    background: 'rgba(59,130,246,0.15)',
+                                    border: '1px solid rgba(59,130,246,0.3)',
+                                    borderRadius: '8px',
+                                    color: 'var(--accent-blue, #3b82f6)',
+                                    cursor: 'pointer',
+                                    fontSize: '0.85rem', fontWeight: 700,
+                                }}
+                            >
+                                {savingOtp ? 'Saving…' : 'Save 2FA Settings'}
+                            </button>
                         </div>
                     )}
 

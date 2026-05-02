@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Lock, UserCheck, Eye, EyeOff, Loader, ArrowLeft } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Lock, UserCheck, Eye, EyeOff, Loader, ArrowLeft, ShieldCheck, RefreshCw } from 'lucide-react';
 import { useAppContext } from '../context/AppContext';
 import { supabase, isSupabaseReady } from '../lib/supabase';
 import './Login.css';
@@ -31,6 +31,9 @@ const ROLE_CONFIG = {
     view:  { label: 'View',  icon: '👁', accent: 'muted', title: 'View Access'   },
 };
 
+const OTP_LENGTH = 6;
+const RESEND_COOLDOWN = 30; // seconds
+
 const hashPassword = async (text) => {
     const msgUint8 = new TextEncoder().encode(text);
     const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
@@ -38,15 +41,104 @@ const hashPassword = async (text) => {
     return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 };
 
+// ── OTP digit boxes ───────────────────────────────────────────────────────────
+const OtpInput = ({ value, onChange, onComplete }) => {
+    const refs = Array.from({ length: OTP_LENGTH }, () => useRef(null));
+
+    const handleChange = (idx, e) => {
+        const char = e.target.value.replace(/\D/g, '').slice(-1);
+        const next = value.split('');
+        next[idx] = char;
+        const newVal = next.join('');
+        onChange(newVal);
+        // auto-advance
+        if (char && idx < OTP_LENGTH - 1) refs[idx + 1].current?.focus();
+        if (newVal.replace(/\s/g, '').length === OTP_LENGTH && !newVal.includes('')) onComplete?.(newVal);
+    };
+
+    const handleKeyDown = (idx, e) => {
+        if (e.key === 'Backspace') {
+            if (!value[idx] && idx > 0) refs[idx - 1].current?.focus();
+        } else if (e.key === 'ArrowLeft' && idx > 0) {
+            refs[idx - 1].current?.focus();
+        } else if (e.key === 'ArrowRight' && idx < OTP_LENGTH - 1) {
+            refs[idx + 1].current?.focus();
+        }
+    };
+
+    const handlePaste = (e) => {
+        const pasted = e.clipboardData.getData('text').replace(/\D/g, '').slice(0, OTP_LENGTH);
+        if (pasted.length > 0) {
+            onChange(pasted.padEnd(OTP_LENGTH, ''));
+            refs[Math.min(pasted.length, OTP_LENGTH - 1)].current?.focus();
+            if (pasted.length === OTP_LENGTH) onComplete?.(pasted);
+        }
+        e.preventDefault();
+    };
+
+    return (
+        <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', margin: '1.25rem 0' }}>
+            {Array.from({ length: OTP_LENGTH }).map((_, i) => (
+                <input
+                    key={i}
+                    ref={refs[i]}
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={1}
+                    value={value[i] || ''}
+                    onChange={e => handleChange(i, e)}
+                    onKeyDown={e => handleKeyDown(i, e)}
+                    onPaste={handlePaste}
+                    autoFocus={i === 0}
+                    style={{
+                        width: '42px',
+                        height: '52px',
+                        textAlign: 'center',
+                        fontSize: '1.4rem',
+                        fontWeight: 700,
+                        background: value[i] ? 'rgba(59,130,246,0.15)' : 'rgba(255,255,255,0.05)',
+                        border: `2px solid ${value[i] ? 'rgba(59,130,246,0.6)' : 'rgba(255,255,255,0.12)'}`,
+                        borderRadius: '10px',
+                        color: 'var(--text-primary)',
+                        outline: 'none',
+                        transition: 'border-color 0.15s, background 0.15s',
+                        caretColor: 'transparent',
+                    }}
+                />
+            ))}
+        </div>
+    );
+};
+
+// ── Main component ────────────────────────────────────────────────────────────
 const Login = () => {
     const { setAuthSession } = useAppContext();
+
+    // Navigation state
+    const [loginStep, setLoginStep]     = useState(1); // 1=role, 2=passcode, 3=OTP
     const [selectedRole, setSelectedRole] = useState(null);
-    const [password, setPassword] = useState('');
+
+    // Passcode step
+    const [password, setPassword]       = useState('');
     const [showPassword, setShowPassword] = useState(false);
-    const [error, setError] = useState('');
-    const [loading, setLoading] = useState(false);
+    const [error, setError]             = useState('');
+    const [loading, setLoading]         = useState(false);
+
+    // OTP step
+    const [otpValue, setOtpValue]       = useState('');
+    const [otpError, setOtpError]       = useState('');
+    const [otpLoading, setOtpLoading]   = useState(false);
+    const [testOtp, setTestOtp]         = useState('');   // stub only — cleared when Resend is wired
+    const [resendTimer, setResendTimer] = useState(0);    // countdown seconds
+    const orgIdRef                      = useRef(null);   // stored after passcode verified
+
+    // Dev mode
     const [devMode, setDevMode] = useState(false);
-    const [orgHashes, setOrgHashes] = useState(null);
+
+    // Org data (fetched once on mount)
+    const [orgHashes, setOrgHashes]     = useState(null); // passcode hashes
+    const [otpEnabled, setOtpEnabled]   = useState(false);
+    const [otpEmail, setOtpEmail]       = useState('');
 
     useEffect(() => {
         const checkHash = () => setDevMode(window.location.hash === '#devmode');
@@ -55,36 +147,89 @@ const Login = () => {
         return () => window.removeEventListener('hashchange', checkHash);
     }, []);
 
-    // Fetch org passcode hashes (anon access — works before login)
+    // Fetch org passcode hashes + OTP settings
     useEffect(() => {
         if (!isSupabaseReady()) return;
         supabase
             .from('organizations')
-            .select('passcode_owner_hash, passcode_staff_hash, passcode_view_hash')
+            .select('id, passcode_owner_hash, passcode_staff_hash, passcode_view_hash, otp_enabled, otp_email')
             .single()
-            .then(({ data }) => { if (data) setOrgHashes(data); });
+            .then(({ data }) => {
+                if (data) {
+                    setOrgHashes(data);
+                    setOtpEnabled(!!data.otp_enabled);
+                    setOtpEmail(data.otp_email || '');
+                    orgIdRef.current = data.id;
+                }
+            });
     }, []);
+
+    // Resend countdown timer
+    useEffect(() => {
+        if (resendTimer <= 0) return;
+        const id = setInterval(() => setResendTimer(t => t - 1), 1000);
+        return () => clearInterval(id);
+    }, [resendTimer]);
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    const goBack = () => {
+        if (loginStep === 3) {
+            setLoginStep(2);
+            setOtpValue('');
+            setOtpError('');
+            setTestOtp('');
+        } else {
+            setSelectedRole(null);
+            setLoginStep(1);
+            setError('');
+            setPassword('');
+            setLoading(false);
+        }
+    };
 
     const handleRoleSelect = (role) => {
         setSelectedRole(role);
+        setLoginStep(2);
         setError('');
         setPassword('');
     };
 
-    const handleBack = () => {
-        setSelectedRole(null);
-        setError('');
-        setPassword('');
-        setLoading(false);
-    };
+    // Called once passcode is correct — sends OTP or does final signIn
+    const doSignIn = useCallback(async () => {
+        const { error: authError } = await supabase.auth.signInWithPassword({
+            email:    ROLE_EMAIL[selectedRole],
+            password: ROLE_PASS[selectedRole],
+        });
+        if (authError) {
+            setError('Authentication failed. Contact administrator.');
+            setLoading(false);
+        }
+        // On success: leave spinner; AppContext.onAuthStateChange unmounts Login
+    }, [selectedRole]);
 
+    const sendOtp = useCallback(async () => {
+        setOtpLoading(true);
+        setOtpError('');
+        setTestOtp('');
+        try {
+            const { data, error } = await supabase.functions.invoke('send-otp', {
+                body: { orgId: orgIdRef.current },
+            });
+            if (error || !data?.ok) throw new Error(data?.error || error?.message || 'Failed to send OTP');
+            if (data.test_otp) setTestOtp(data.test_otp); // dev stub
+            setResendTimer(RESEND_COOLDOWN);
+        } catch (err) {
+            setOtpError(err.message);
+        } finally {
+            setOtpLoading(false);
+        }
+    }, []);
+
+    // ── Passcode submit ───────────────────────────────────────────────────────
     const handleLogin = async (e) => {
         e.preventDefault();
         setError('');
         setLoading(true);
-        // Track whether Supabase auth was dispatched — in that case we leave the
-        // spinner running until onAuthStateChange fires and unmounts this component.
-        let supabaseAuthDispatched = false;
 
         try {
             // Dev/super-admin shortcut
@@ -93,10 +238,10 @@ const Login = () => {
                 return;
             }
 
-            // ── Path 1: Supabase Auth with hash verification ──────────────────
             if (isSupabaseReady()) {
+                // Verify passcode hash
                 if (window.crypto?.subtle) {
-                    const hashed = await hashPassword(password);
+                    const hashed       = await hashPassword(password);
                     const expectedHash = orgHashes?.[`passcode_${selectedRole}_hash`] || FALLBACK_HASHES[selectedRole];
                     if (hashed !== expectedHash) {
                         setError('Invalid passcode.');
@@ -104,25 +249,24 @@ const Login = () => {
                     }
                 }
 
-                const { error: authError } = await supabase.auth.signInWithPassword({
-                    email: ROLE_EMAIL[selectedRole],
-                    password: ROLE_PASS[selectedRole],
-                });
-
-                if (authError) {
-                    setError('Authentication failed. Contact administrator.');
+                // Owner + OTP enabled → send OTP and advance to Step 3
+                if (selectedRole === 'owner' && otpEnabled) {
+                    setLoading(false);
+                    setLoginStep(3);
+                    setOtpValue('');
+                    setOtpError('');
+                    // Fire-and-forget OTP send (spinner shows inside OTP step)
+                    sendOtp();
                     return;
                 }
 
-                // Success — leave spinner on; AppContext onAuthStateChange will
-                // fetch profile + data then unmount Login.
-                supabaseAuthDispatched = true;
+                // No OTP — sign in directly
+                await doSignIn();
                 return;
             }
 
-            // ── Path 2: Offline / no Supabase fallback ────────────────────────
+            // ── Offline fallback ─────────────────────────────────────────────
             if (!window.crypto?.subtle) {
-                // Insecure context (HTTP local network) — plain compare
                 if (ROLE_PASS[selectedRole] === password) setAuthSession({ role: selectedRole });
                 else setError('Invalid passcode.');
                 return;
@@ -136,26 +280,52 @@ const Login = () => {
             console.error(err);
             setError('Login error: ' + err.message);
         } finally {
-            if (!supabaseAuthDispatched) setLoading(false);
+            // Only clear spinner if we didn't hand off to Supabase auth or OTP
+            if (loginStep !== 3) setLoading(false);
         }
     };
 
+    // ── OTP verify ────────────────────────────────────────────────────────────
+    const handleOtpVerify = async (code) => {
+        const digits = (code || otpValue).replace(/\s/g, '');
+        if (digits.length !== OTP_LENGTH) return;
+        setOtpLoading(true);
+        setOtpError('');
+        try {
+            const { data, error } = await supabase.functions.invoke('verify-otp', {
+                body: { orgId: orgIdRef.current, code: digits },
+            });
+            if (error || !data?.ok) throw new Error(data?.error || error?.message || 'Verification failed');
+            // OTP correct — proceed with Supabase Auth (spinner stays on)
+            setLoading(true);
+            await doSignIn();
+        } catch (err) {
+            setOtpError(err.message);
+            setOtpLoading(false);
+        }
+    };
+
+    // ── Render ────────────────────────────────────────────────────────────────
     const roleConfig = selectedRole ? ROLE_CONFIG[selectedRole] : null;
 
     return (
         <div className="login-container">
             <div className="login-card glass-panel animate-fade-in">
+
                 {/* Header */}
                 <div className="login-header">
                     <div className="login-icon-wrap">
-                        <Lock size={32} className="text-blue" />
+                        {loginStep === 3
+                            ? <ShieldCheck size={32} style={{ color: '#3b82f6' }} />
+                            : <Lock size={32} className="text-blue" />
+                        }
                     </div>
                     <h2>JJ Jewellers</h2>
                     <p>JJ Ledger Pro</p>
                 </div>
 
-                {/* Step 1: Role selector */}
-                {!selectedRole && (
+                {/* ══ STEP 1 — Role selector ══ */}
+                {loginStep === 1 && (
                     <div>
                         <p className="login-step-label">Select your role to continue</p>
                         <div className="role-grid">
@@ -174,11 +344,11 @@ const Login = () => {
                     </div>
                 )}
 
-                {/* Step 2: Passcode input */}
-                {selectedRole && (
+                {/* ══ STEP 2 — Passcode ══ */}
+                {loginStep === 2 && (
                     <div>
                         <div className="login-step-header">
-                            <button className="login-back-btn" onClick={handleBack} type="button">
+                            <button className="login-back-btn" onClick={goBack} type="button">
                                 <ArrowLeft size={18} />
                             </button>
                             <span className="login-step-title">{roleConfig.title}</span>
@@ -218,6 +388,86 @@ const Login = () => {
                         </form>
 
                         <p className="login-footer-hint">Contact your administrator for your access code</p>
+                    </div>
+                )}
+
+                {/* ══ STEP 3 — OTP verification (owner only) ══ */}
+                {loginStep === 3 && (
+                    <div>
+                        <div className="login-step-header">
+                            <button className="login-back-btn" onClick={goBack} type="button" disabled={otpLoading || loading}>
+                                <ArrowLeft size={18} />
+                            </button>
+                            <span className="login-step-title">Two-Factor Verification</span>
+                        </div>
+
+                        <div style={{ textAlign: 'center', margin: '0.5rem 0 0' }}>
+                            <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                                {otpEmail
+                                    ? <>A 6-digit code was sent to <strong style={{ color: 'var(--text-secondary)' }}>{otpEmail}</strong></>
+                                    : 'Enter the 6-digit code from your registered email'
+                                }
+                            </p>
+                        </div>
+
+                        <OtpInput
+                            value={otpValue}
+                            onChange={setOtpValue}
+                            onComplete={handleOtpVerify}
+                        />
+
+                        {/* Test-mode hint — only shown when Edge Function returns test_otp */}
+                        {testOtp && (
+                            <div style={{
+                                textAlign: 'center',
+                                padding: '0.5rem 0.75rem',
+                                background: 'rgba(245,158,11,0.1)',
+                                border: '1px solid rgba(245,158,11,0.25)',
+                                borderRadius: '8px',
+                                marginBottom: '0.75rem',
+                            }}>
+                                <span style={{ fontSize: '0.75rem', color: '#f59e0b' }}>
+                                    🧪 Test mode — code: <strong style={{ letterSpacing: '0.15em', fontFamily: 'monospace' }}>{testOtp}</strong>
+                                </span>
+                            </div>
+                        )}
+
+                        {otpError && <div className="login-error">{otpError}</div>}
+
+                        <button
+                            className="login-btn"
+                            onClick={() => handleOtpVerify()}
+                            disabled={otpLoading || loading || otpValue.replace(/\s/g, '').length < OTP_LENGTH}
+                            style={{ marginBottom: '0.75rem' }}
+                        >
+                            {otpLoading || loading
+                                ? <><Loader size={18} className="spin" /> Verifying…</>
+                                : <><ShieldCheck size={18} /> Verify Code</>
+                            }
+                        </button>
+
+                        {/* Resend */}
+                        <div style={{ textAlign: 'center' }}>
+                            {resendTimer > 0 ? (
+                                <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                                    Resend in {resendTimer}s
+                                </span>
+                            ) : (
+                                <button
+                                    type="button"
+                                    onClick={sendOtp}
+                                    disabled={otpLoading}
+                                    style={{
+                                        background: 'none', border: 'none',
+                                        color: 'var(--accent-blue, #3b82f6)',
+                                        cursor: 'pointer', fontSize: '0.82rem',
+                                        display: 'inline-flex', alignItems: 'center', gap: '4px',
+                                    }}
+                                >
+                                    <RefreshCw size={13} /> Resend code
+                                </button>
+                            )}
+                        </div>
                     </div>
                 )}
 
